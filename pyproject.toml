@@ -1,0 +1,24 @@
+[project]
+name = "stackline-crawling"
+version = "0.1.0"
+description = "Runtime aislado de crawling y agente JSON para Stackline"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "beautifulsoup4==4.13.4",
+  "httpx==0.28.1"
+]
+
+[project.optional-dependencies]
+browser = ["playwright==1.52.0"]
+
+audit = ["pytest==8.3.5"]
+
+[project.scripts]
+stackline-crawl = "stackline_crawling.cli:main"
+
+[build-system]
+requires = ["setuptools==78.1.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["stackline_crawling*"]
