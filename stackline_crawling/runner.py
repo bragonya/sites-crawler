@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -56,6 +57,59 @@ class BuildLock:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
             finally:
                 self.handle.close()
+
+
+class RunHeartbeat:
+    def __init__(self, path: Path, run_id: str, started_at: float) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.started_at = started_at
+        self.stage = "initializing"
+        self.quality_attempts = 0
+        self.technical_iterations = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, name=f"crawl-heartbeat-{run_id}", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+        self.write()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def set_stage(self, stage: str) -> None:
+        with self.lock:
+            self.stage = stage
+        self.write()
+
+    def set_counts(self, quality_attempts: int, technical_iterations: int) -> None:
+        with self.lock:
+            self.quality_attempts = quality_attempts
+            self.technical_iterations = technical_iterations
+        self.write()
+
+    def write(self) -> None:
+        with self.lock:
+            stage = self.stage
+            quality_attempts = self.quality_attempts
+            technical_iterations = self.technical_iterations
+        now = time.time()
+        _write_json(self.path, {
+            "run_id": self.run_id,
+            "status": "RUNNING",
+            "stage": stage,
+            "started_at": self.started_at,
+            "last_heartbeat_at": now,
+            "elapsed_seconds": round(now - self.started_at, 1),
+            "quality_attempts": quality_attempts,
+            "technical_iterations": technical_iterations,
+        })
+
+    def _loop(self) -> None:
+        while not self.stop_event.wait(5):
+            self.write()
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -115,6 +169,63 @@ def _agent_summary(result: dict[str, Any], quality_attempts: int, technical_iter
     }
 
 
+def normalize_metrics(
+    raw_metrics: dict[str, Any],
+    products: list[dict[str, Any]],
+    categories: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Map common site-crawler aliases into the runner's canonical metrics."""
+    metrics = dict(raw_metrics)
+
+    def integer(value: Any, default: int = 0) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def first(*keys: str, default: Any = None) -> Any:
+        for key in keys:
+            if key in metrics and metrics[key] is not None:
+                return metrics[key]
+        return default
+
+    products_extracted = integer(first("products_extracted"), len(products))
+    categories_extracted = integer(first("categories_extracted"), len(categories))
+    failed_urls = first("failed_urls", default=[])
+    failed_pages = integer(first("pages_failed", "failed_pages"), len(failed_urls) if isinstance(failed_urls, list) else 0)
+    unique_products = first("unique_products")
+    duplicate_products = first("duplicate_products")
+    if duplicate_products is None and unique_products is not None:
+        duplicate_products = max(products_extracted - integer(unique_products), 0)
+
+    def has_price(product: dict[str, Any]) -> bool:
+        return any(
+            product.get(key) is not None and str(product.get(key)).strip() != ""
+            for key in ("unitCost", "unit_cost", "price")
+        )
+
+    prices = first("products_with_price")
+    if prices is None:
+        prices = sum(1 for product in products if isinstance(product, dict) and has_price(product))
+
+    metrics.update({
+        "pages_discovered": integer(first("pages_discovered", "discovered_pages")),
+        "pages_visited": integer(first("pages_visited", "visited_pages")),
+        "pages_failed": failed_pages,
+        "products_extracted": products_extracted,
+        "products_with_price": integer(prices),
+        "categories_extracted": categories_extracted,
+        "product_links_found": integer(first("product_links_found"), products_extracted),
+        "pagination_links_found": integer(first("pagination_links_found")),
+        "duplicate_products": integer(duplicate_products),
+        "blocked_or_challenge_detected": bool(first("blocked_or_challenge_detected", default=False)),
+        "response_size_bytes": integer(first("response_size_bytes")),
+        "html_fingerprint": str(first("html_fingerprint", default="not-available")),
+        "duration_ms": integer(first("duration_ms")),
+    })
+    return metrics
+
+
 def _finalize_generated_result(
     raw: dict[str, Any],
     run_id: str,
@@ -125,16 +236,17 @@ def _finalize_generated_result(
     if not isinstance(raw, dict):
         raise WorkspaceError("El crawler debe producir un objeto JSON")
     data = raw.get("data")
-    metrics = raw.get("metrics")
     if not isinstance(data, dict) or not isinstance(data.get("products"), list) or not isinstance(data.get("categories"), list):
         raise WorkspaceError("El crawler debe producir data.products y data.categories como listas")
-    if not isinstance(metrics, dict):
-        raise WorkspaceError("El crawler debe producir metrics como objeto")
     products = data["products"]
     categories = data["categories"]
-    if metrics.get("products_extracted") != len(products):
+    raw_metrics = raw.get("metrics")
+    if not isinstance(raw_metrics, dict):
+        raise WorkspaceError("El crawler debe producir metrics como objeto")
+    metrics = normalize_metrics(raw_metrics, products, categories)
+    if metrics["products_extracted"] != len(products):
         raise WorkspaceError("metrics.products_extracted no coincide con data.products")
-    if metrics.get("categories_extracted") != len(categories):
+    if metrics["categories_extracted"] != len(categories):
         raise WorkspaceError("metrics.categories_extracted no coincide con data.categories")
     result = dict(raw)
     result.update({"schema_version": 1, "run_id": run_id, "source": source, "data": data, "metrics": metrics})
@@ -165,8 +277,25 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
     technical_iterations = 0
     thresholds = Thresholds.from_payload(payload.get("thresholds"))
 
+    heartbeat: RunHeartbeat | None = None
+    started_at = time.time()
+
     def append(role: str, content: str, metadata: dict[str, Any] | None = None) -> None:
         _append_transcript(transcript, role, content, metadata)
+
+    def finish_result(final: dict[str, Any]) -> dict[str, Any]:
+        nonlocal heartbeat
+        if heartbeat is not None:
+            heartbeat.stop()
+        _write_json(build_root / "run-state.json", {
+            "run_id": run_id,
+            "status": final.get("status", "COMPLETED"),
+            "finished_at": time.time(),
+            "quality_attempts": quality_attempts,
+            "technical_iterations": technical_iterations,
+            "quality": final.get("quality", {}),
+        })
+        return final
 
     try:
         with BuildLock(build_root, run_id):
@@ -181,10 +310,15 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
             _write_json(build_root / "run-state.json", {
                 "run_id": run_id,
                 "status": "RUNNING",
-                "started_at": time.time(),
+                "stage": "initializing",
+                "started_at": started_at,
+                "last_heartbeat_at": started_at,
+                "elapsed_seconds": 0,
                 "quality_attempts": quality_attempts,
                 "technical_iterations": technical_iterations,
             })
+            heartbeat = RunHeartbeat(build_root / "run-state.json", run_id, started_at)
+            heartbeat.start()
             append("system", "Crawling iniciado", source)
 
             if os.getenv("AI_MODE", "real").lower() == "fake":
@@ -210,10 +344,15 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                     if technical_iterations >= 10:
                         return {"ok": False, "status": "EXECUTION_FAILED", "error": {"code": "TECHNICAL_ITERATIONS_EXHAUSTED", "message": "Se agotaron las iteraciones técnicas"}, "stop_agent": True}
                     technical_iterations += 1
+                    heartbeat.set_counts(quality_attempts, technical_iterations)
+                    heartbeat.set_stage("executing_crawler")
                     try:
                         raw = run_workspace(workspace_root, build_root, site_url, run_id)
+                        heartbeat.set_stage("evaluating_health")
                         candidate = _finalize_generated_result(raw, run_id, source, payload.get("baseline_products"), thresholds)
                     except (WorkspaceError, ContractError, ValueError) as error:
+                        heartbeat.set_counts(quality_attempts, technical_iterations)
+                        heartbeat.set_stage("technical_error")
                         append("tool", "run_workspace falló técnicamente", {"error": str(error), "technical_iterations": technical_iterations})
                         _write_json(build_root / "run-state.json", {
                             "run_id": run_id, "status": "RUNNING", "started_at": time.time(),
@@ -229,14 +368,16 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                             "stop_agent": technical_iterations >= 10,
                         }
                     quality_attempts += 1
+                    heartbeat.set_counts(quality_attempts, technical_iterations)
+                    heartbeat.set_stage("health_evaluated")
                     mark_ready(workspace_root)
                     latest_result = candidate
                     _write_json(build_root / "results/crawl-result.json", candidate)
                     _write_json(build_root / "results/health-result.json", candidate["quality"])
                     _write_json(build_root / "run-state.json", {
-                        "run_id": run_id, "status": candidate["status"], "finished_at": time.time(),
-                        "quality_attempts": quality_attempts, "technical_iterations": technical_iterations,
-                        "quality": candidate["quality"],
+                        "run_id": run_id, "status": "RUNNING", "stage": "health_evaluated", "started_at": started_at,
+                        "last_result_status": candidate["status"], "quality_attempts": quality_attempts,
+                        "technical_iterations": technical_iterations, "quality": candidate["quality"],
                     })
                     append("tool", "run_workspace produjo resultado evaluable", _agent_summary(candidate, quality_attempts, technical_iterations))
                     summary = _agent_summary(candidate, quality_attempts, technical_iterations)
@@ -251,7 +392,7 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                     initial_state = execute_current_workspace({})
                     if initial_state.get("status") == "COMPLETED" and not user_feedback:
                         result = latest_result
-                        return result
+                        return finish_result(result)
                     reason = "user_feedback" if user_feedback else (
                         "health_below_threshold" if initial_state.get("status") == "QUALITY_FAILED" else "execution_error"
                     )
@@ -288,13 +429,16 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                     handlers=handlers,
                     transcript=append,
                 )
+                heartbeat.set_stage("agent_editing")
                 agent.run()
                 if latest_result is None:
                     raise WorkspaceError("La IA terminó sin ejecutar un crawler válido")
 
             result = latest_result
-            return result
+            return finish_result(result)
     except (ContractError, AgentExecutionError, RuntimeError, ValueError, WorkspaceError) as error:
+        if heartbeat is not None:
+            heartbeat.stop()
         result["error"] = {"code": "EXECUTION_ERROR", "message": str(error), "retryable": True}
         _write_json(build_root / "results/crawl-result.json", result)
         _write_json(build_root / "run-state.json", {

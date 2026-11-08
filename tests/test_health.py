@@ -1,5 +1,6 @@
 from stackline_crawling.contracts import ContractError, Thresholds, validate_result
 from stackline_crawling.health import evaluate_health
+from stackline_crawling.runner import normalize_metrics
 
 
 def metrics(products=10, prices=10, failed=0):
@@ -24,6 +25,31 @@ def test_first_run_is_accepted():
     health = evaluate_health(metrics(), None, Thresholds())
     assert health["state"] == "first_run"
 
+
+
+def test_generated_metric_aliases_are_normalized():
+    normalized = normalize_metrics(
+        {
+            "discovered_pages": 13,
+            "visited_pages": 154,
+            "failed_pages": 0,
+            "products_extracted": 2_887,
+            "categories_extracted": 13,
+            "unique_products": 2_887,
+            "html_fingerprint": "sha256:test",
+        },
+        [{"name": "Producto", "price": 79.0}],
+        [{"name": "Categoría"}],
+    )
+
+    assert normalized["pages_discovered"] == 13
+    assert normalized["pages_visited"] == 154
+    assert normalized["pages_failed"] == 0
+    assert normalized["products_extracted"] == 2_887
+    assert normalized["products_with_price"] == 1
+    assert normalized["categories_extracted"] == 13
+    assert normalized["duplicate_products"] == 0
+    assert normalized["html_fingerprint"] == "sha256:test"
 
 def test_empty_result_fails_quality():
     health = evaluate_health(metrics(products=0, prices=0), None, Thresholds())

@@ -35,7 +35,17 @@ class CrawlingHandler(BaseHTTPRequestHandler):
             if not job:
                 self._json(404, {"error": "run_id no encontrado en este proceso"})
                 return
-            self._json(200, job)
+            response = dict(job)
+            state_path = Path(str(job.get("build_root", ""))) / "run-state.json"
+            if state_path.is_file():
+                try:
+                    progress = json.loads(state_path.read_text(encoding="utf-8"))
+                    response["progress"] = progress
+                    if response.get("status") == "RUNNING":
+                        response.update(progress)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            self._json(200, response)
             return
         self._json(404, {"error": "ruta no encontrada"})
 
