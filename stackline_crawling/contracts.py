@@ -81,3 +81,73 @@ def validate_result(result: dict[str, Any]) -> None:
     for product in data["products"]:
         if not isinstance(product, dict) or not str(product.get("name", "")).strip():
             raise ContractError("Cada producto debe tener name")
+
+
+def validate_categories_result(result: dict[str, Any]) -> None:
+    """Contrato del modo discover: árbol de categorías externas, sin productos.
+
+    categories: [{id, name, url, parentId|null}]. El árbol lo define el sitio; el runtime
+    solo valida su forma (ids únicos, padres existentes, sin ciclos).
+    """
+    if not isinstance(result, dict) or result.get("schema_version") != 1:
+        raise ContractError("El descubrimiento debe ser un objeto con schema_version=1")
+    categories = result.get("categories")
+    if not isinstance(categories, list) or not categories:
+        raise ContractError("categories debe ser una lista no vacía")
+    if "products" in result or "products" in (result.get("data") or {}):
+        raise ContractError("El modo discover no debe devolver productos")
+    ids: set[str] = set()
+    for category in categories:
+        if not isinstance(category, dict):
+            raise ContractError("Cada categoría debe ser un objeto")
+        category_id = category.get("id")
+        if not isinstance(category_id, str) or not category_id.strip():
+            raise ContractError("Cada categoría necesita id string no vacío")
+        if category_id in ids:
+            raise ContractError(f"Id de categoría duplicado: {category_id}")
+        ids.add(category_id)
+        if not isinstance(category.get("name"), str) or not category["name"].strip():
+            raise ContractError(f"La categoría {category_id} necesita name")
+        url = category.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ContractError(f"La categoría {category_id} necesita url HTTP(S) absoluta")
+    parents = {}
+    for category in categories:
+        parent = category.get("parentId")
+        if parent is not None and parent not in ids:
+            raise ContractError(f"parentId inexistente en la categoría {category['id']}: {parent}")
+        if parent == category["id"]:
+            raise ContractError(f"La categoría {category['id']} es su propio padre")
+        parents[category["id"]] = parent
+    for start in parents:
+        seen = {start}
+        current = parents[start]
+        while current is not None:
+            if current in seen:
+                raise ContractError(f"Ciclo en el árbol de categorías cerca de {start}")
+            seen.add(current)
+            current = parents[current]
+
+
+def validate_scope(scope: Any) -> list[dict[str, Any]]:
+    """category-scope.json: [{id, url, path:[nombres desde la raíz]}] elegido por el usuario."""
+    if not isinstance(scope, list) or not scope:
+        raise ContractError("category_scope debe ser una lista no vacía")
+    for item in scope:
+        if not isinstance(item, dict) or not isinstance(item.get("url"), str) or not item["url"].strip():
+            raise ContractError("Cada elemento de category_scope necesita url")
+        path = item.get("path")
+        if not isinstance(path, list) or not path or not all(isinstance(part, str) and part.strip() for part in path):
+            raise ContractError("Cada elemento de category_scope necesita path con nombres")
+    return scope
+
+
+def validate_scope_conformance(products: list[dict[str, Any]], scope: list[dict[str, Any]]) -> None:
+    """Con alcance, todo producto debe pertenecer a una categoría elegida (categoryPath con prefijo del path)."""
+    paths = [tuple(item["path"]) for item in scope]
+    for product in products:
+        category_path = product.get("categoryPath")
+        if not isinstance(category_path, list) or not any(tuple(category_path[: len(path)]) == path for path in paths):
+            raise ContractError(
+                f"El producto '{product.get('name')}' no pertenece a las categorías elegidas (categoryPath={category_path})"
+            )

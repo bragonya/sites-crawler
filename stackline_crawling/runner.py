@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .contracts import ContractError, Thresholds, validate_result
+from .contracts import (
+    ContractError,
+    Thresholds,
+    validate_categories_result,
+    validate_result,
+    validate_scope,
+    validate_scope_conformance,
+)
 from .crawler import PublicSiteCrawler
 from .health import evaluate_health
 from .sop_runtime import read_sop_section, sop_index, update_sop_section
@@ -24,6 +31,7 @@ from .workspace_runtime import (
     query_artifacts,
     read_workspace,
     run_workspace,
+    workspace_capabilities,
     write_workspace,
 )
 
@@ -255,7 +263,7 @@ def _finalize_generated_result(
     result["status"] = "COMPLETED" if health["state"] in {"healthy", "first_run"} else "QUALITY_FAILED"
     result["error"] = None if result["status"] == "COMPLETED" else {
         "code": "QUALITY_THRESHOLD_FAILED",
-        "message": "El resultado no superó los umbrales",
+        "message": "Quality thresholds were not met",
         "retryable": True,
     }
     validate_result(result)
@@ -319,9 +327,17 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
             })
             heartbeat = RunHeartbeat(build_root / "run-state.json", run_id, started_at)
             heartbeat.start()
-            append("system", "Crawling iniciado", source)
+            append("system", "Crawling started", source)
+            scope: list[dict[str, Any]] | None = None
+            scope_path: Path | None = None
+            if payload.get("category_scope") is not None:
+                scope = validate_scope(payload["category_scope"])
+                scope_path = build_root / "category-scope.json"
+                _write_json(scope_path, scope)
 
             if os.getenv("AI_MODE", "real").lower() == "fake":
+                if scope is not None:
+                    raise ValueError("El crawl por categorías requiere AI_MODE=real")
                 observation = PublicSiteCrawler(build_root).crawl(site_url, payload.get("max_pages"))
                 raw = {
                     "schema_version": 1,
@@ -335,25 +351,27 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                 latest_result = _finalize_generated_result(raw, run_id, source, payload.get("baseline_products"), thresholds)
                 _write_json(build_root / "results/crawl-result.json", latest_result)
                 _write_json(build_root / "results/health-result.json", latest_result["quality"])
-                append("assistant", "Modo fake: el crawler determinista produjo el JSON contractual", latest_result["quality"])
+                append("assistant", "Fake mode: deterministic crawler produced the contract JSON", latest_result["quality"])
             else:
                 def execute_current_workspace(_arguments: dict[str, Any]) -> dict[str, Any]:
                     nonlocal latest_result, quality_attempts, technical_iterations
                     if quality_attempts >= 3:
-                        return {"ok": False, "status": "QUALITY_FAILED", "error": {"code": "QUALITY_ATTEMPTS_EXHAUSTED", "message": "Se agotaron los 3 intentos de quality"}, "stop_agent": True}
+                        return {"ok": False, "status": "QUALITY_FAILED", "error": {"code": "QUALITY_ATTEMPTS_EXHAUSTED", "message": "Quality attempts exhausted"}, "stop_agent": True}
                     if technical_iterations >= 10:
-                        return {"ok": False, "status": "EXECUTION_FAILED", "error": {"code": "TECHNICAL_ITERATIONS_EXHAUSTED", "message": "Se agotaron las iteraciones técnicas"}, "stop_agent": True}
+                        return {"ok": False, "status": "EXECUTION_FAILED", "error": {"code": "TECHNICAL_ITERATIONS_EXHAUSTED", "message": "Technical iterations exhausted"}, "stop_agent": True}
                     technical_iterations += 1
                     heartbeat.set_counts(quality_attempts, technical_iterations)
                     heartbeat.set_stage("executing_crawler")
                     try:
-                        raw = run_workspace(workspace_root, build_root, site_url, run_id)
+                        raw = run_workspace(workspace_root, build_root, site_url, run_id, scope_path=scope_path)
                         heartbeat.set_stage("evaluating_health")
                         candidate = _finalize_generated_result(raw, run_id, source, payload.get("baseline_products"), thresholds)
+                        if scope is not None:
+                            validate_scope_conformance(candidate["data"]["products"], scope)
                     except (WorkspaceError, ContractError, ValueError) as error:
                         heartbeat.set_counts(quality_attempts, technical_iterations)
                         heartbeat.set_stage("technical_error")
-                        append("tool", "run_workspace falló técnicamente", {"error": str(error), "technical_iterations": technical_iterations})
+                        append("tool", "run_workspace failed technically", {"error": str(error), "technical_iterations": technical_iterations})
                         _write_json(build_root / "run-state.json", {
                             "run_id": run_id, "status": "RUNNING", "started_at": time.time(),
                             "quality_attempts": quality_attempts, "technical_iterations": technical_iterations,
@@ -379,7 +397,7 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                         "last_result_status": candidate["status"], "quality_attempts": quality_attempts,
                         "technical_iterations": technical_iterations, "quality": candidate["quality"],
                     })
-                    append("tool", "run_workspace produjo resultado evaluable", _agent_summary(candidate, quality_attempts, technical_iterations))
+                    append("tool", "run_workspace produced an evaluable result", _agent_summary(candidate, quality_attempts, technical_iterations))
                     summary = _agent_summary(candidate, quality_attempts, technical_iterations)
                     sop_pending = site_sop_path.is_file() and "Pendiente de descubrir por el agente." in site_sop_path.read_text(encoding="utf-8")
                     summary["sop_review_required"] = sop_pending
@@ -388,7 +406,11 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
 
                 has_existing_crawler = not scaffold_created and not is_scaffold(workspace_root)
                 user_feedback = str(payload.get("user_prompt") or "").strip()
-                if has_existing_crawler:
+                scope_unsupported = scope is not None and "category_scope" not in workspace_capabilities(workspace_root)
+                if has_existing_crawler and scope_unsupported:
+                    initial_state = {"status": "NOT_RUN", "quality_attempts": 0, "technical_iterations": 0}
+                    reason = "category_scope_required"
+                elif has_existing_crawler:
                     initial_state = execute_current_workspace({})
                     if initial_state.get("status") == "COMPLETED" and not user_feedback:
                         result = latest_result
@@ -406,6 +428,9 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
                     reason = "first_script"
 
                 initial_state = {**initial_state, "invocation_reason": reason, "user_feedback": user_feedback}
+                if scope is not None:
+                    initial_state["category_scope_file"] = "category-scope.json (en build_root; léelo con query_artifacts)"
+                    initial_state["category_scope_items"] = len(scope)
                 host = urlparse(site_url).hostname or ""
                 handlers = {
                     "workspace_list": lambda _args: {"files": list_workspace(workspace_root)},
@@ -446,5 +471,5 @@ def run_crawl(payload: dict[str, Any]) -> dict[str, Any]:
             "quality_attempts": quality_attempts, "technical_iterations": technical_iterations,
             "error": str(error),
         })
-        append("system", "Fallo de ejecución", {"error": str(error)})
+        append("system", "Execution failed", {"error": str(error)})
         return result

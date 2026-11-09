@@ -146,6 +146,9 @@ Reglas:
 - Usa web_fetch para inspeccionar páginas públicas del sitio.
 - El entrypoint declarado en manifest.json debe aceptar --site-url, --output y --run-id.
 - El crawler debe escribir directamente results/crawl-result.json con schema_version=1, data.categories, data.products y metrics.
+- Descubrimiento de categorías (contrato obligatorio): el entrypoint también debe soportar `--mode discover`. En ese modo NO extrae productos: escribe en --output {"schema_version":1,"run_id":ID,"categories":[{"id","name","url","parentId"}],"metrics":{}}. id es un string único y estable que tú eliges según el sitio; parentId es null o el id de otra categoría (árbol sin ciclos); url es absoluta. Recorre solo páginas de categorías/menús, nunca fichas de producto ni paginación de productos. Cómo el sitio expone sus categorías y jerarquía es conocimiento del sitio: documéntalo en la sección "category-discovery" del site-sop con sop_update, y no lo pongas en el runtime ni lo asumas de otros sitios.
+- Crawl acotado: el entrypoint también acepta `--scope RUTA` con un JSON [{"id","url","path":["Raíz","Hija",...]}]. Con --scope, extrae productos SOLO de esas categorías (sigue su paginación) y cada producto debe llevar categoryPath exactamente igual al path de su categoría. Sin --scope, el comportamiento actual no cambia. El runtime rechaza productos fuera del alcance.
+- Si initial_state.task es "discover_categories" o invocation_reason es "category_discovery_required"/"category_scope_required", tu trabajo es implementar/reparar discover y --scope en el crawler existente sin romper el modo crawl, y validar con run_workspace (que en descubrimiento ejecuta --mode discover). No agregues "category_scope" a manifest.capabilities: lo declara el runtime.
 - Usa run_workspace para probar el código.
 - Después de ejecutar, solo recibirás status, health, métricas y errores. Nunca recibirás automáticamente products, categories ni HTML completo.
 - Trata los artefactos como archivos potencialmente de alto volumen: no intentes leerlos completos.
@@ -228,11 +231,15 @@ class OpenAIWorkspaceAgent:
                 last_message = str(content)
                 self.transcript("assistant", last_message, {"step": step, "tool_calls": len(message.get("tool_calls") or [])})
                 tool_calls = message.get("tool_calls") or []
-                messages.append({
+                assistant_message = {
                     "role": "assistant",
                     "content": message.get("content"),
-                    "tool_calls": tool_calls,
-                })
+                }
+                # OpenAI rejects tool_calls=[]; omit the field when the assistant
+                # returned a normal text message without function calls.
+                if tool_calls:
+                    assistant_message["tool_calls"] = tool_calls
+                messages.append(assistant_message)
                 if not tool_calls:
                     if sop_review_required:
                         reminder = "Antes de terminar, debes documentar el conocimiento durable descubierto usando sop_update. No finalices solo con texto mientras sop_review_required sea true."
