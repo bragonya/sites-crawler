@@ -174,7 +174,27 @@ def fetch_public_url(url: str, allowed_host: str, build_root: Path, max_bytes: i
     }
 
 
-def run_workspace(workspace_root: Path, build_root: Path, site_url: str, run_id: str, timeout_seconds: int = 300) -> dict[str, Any]:
+def workspace_capabilities(workspace_root: Path) -> set[str]:
+    try:
+        manifest = json.loads((workspace_root / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    capabilities = manifest.get("capabilities")
+    return {str(item) for item in capabilities} if isinstance(capabilities, list) else set()
+
+
+def run_workspace(
+    workspace_root: Path,
+    build_root: Path,
+    site_url: str,
+    run_id: str,
+    timeout_seconds: int = 300,
+    *,
+    mode: str = "crawl",
+    scope_path: Path | None = None,
+) -> dict[str, Any]:
+    if mode not in {"crawl", "discover"}:
+        raise WorkspaceError("mode debe ser crawl o discover")
     manifest_path = workspace_root / "manifest.json"
     if not manifest_path.is_file():
         raise WorkspaceError("Falta workspace/manifest.json")
@@ -188,12 +208,19 @@ def run_workspace(workspace_root: Path, build_root: Path, site_url: str, run_id:
     script = _safe_path(workspace_root, entrypoint)
     if not script.is_file():
         raise WorkspaceError(f"No existe el entrypoint: {entrypoint}")
-    output_path = build_root / "results" / "crawl-result.json"
+    output_name = "categories-result.json" if mode == "discover" else "crawl-result.json"
+    output_path = build_root / "results" / output_name
+    if output_path.exists():
+        output_path.unlink()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    stdout_path = build_root / "logs" / "runner.stdout.log"
-    stderr_path = build_root / "logs" / "runner.stderr.log"
+    stdout_path = build_root / "logs" / f"runner.{mode}.stdout.log"
+    stderr_path = build_root / "logs" / f"runner.{mode}.stderr.log"
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, str(script), "--site-url", site_url, "--output", str(output_path), "--run-id", run_id]
+    if mode == "discover":
+        command += ["--mode", "discover"]
+    elif scope_path is not None:
+        command += ["--scope", str(scope_path)]
     try:
         completed = subprocess.run(
             command,
@@ -211,8 +238,8 @@ def run_workspace(workspace_root: Path, build_root: Path, site_url: str, run_id:
     if completed.returncode != 0:
         raise WorkspaceError(f"El crawler terminó con exit code {completed.returncode}: {completed.stderr[-4_000:]}")
     if not output_path.is_file():
-        raise WorkspaceError("El crawler terminó correctamente pero no produjo results/crawl-result.json")
+        raise WorkspaceError(f"The crawler finished successfully but did not produce results/{output_name}")
     try:
         return json.loads(output_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
-        raise WorkspaceError(f"crawl-result.json no es JSON válido: {error}") from error
+        raise WorkspaceError(f"{output_name} no es JSON válido: {error}") from error

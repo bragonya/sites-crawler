@@ -9,6 +9,8 @@ SCAFFOLD_MANIFEST = {
     "status": "SCAFFOLD",
     "entrypoint": "crawl.py",
     "contract": "crawl-result.schema.v1",
+    # Se agrega "category_scope" cuando crawl.py soporta --mode discover y --scope.
+    "capabilities": [],
 }
 
 SCAFFOLD_SITE_SOP = """# Site-specific crawler notes
@@ -20,6 +22,10 @@ Pendiente de descubrir por el agente.
 ## Catalog
 
 Pendiente de descubrir por el agente.
+
+## Category Discovery
+
+Pendiente de descubrir por el agente. Cómo se exponen las categorías del sitio y su jerarquía (padre/hijo), y cómo filtrar por categoría al extraer productos.
 
 ## Pagination
 
@@ -36,8 +42,21 @@ Pendiente de descubrir por el agente.
 
 SCAFFOLD_CRAWL = '''"""Site-specific crawler entrypoint.
 
-The agent must implement the site functions below. The runner invokes this file
-with --site-url, --output and --run-id and expects a complete crawl-result.json.
+The agent must implement the site functions below. The runner invokes this file with:
+
+  --site-url URL --output PATH --run-id ID                 (modo crawl, por defecto)
+  --scope PATH                                             (crawl acotado, ver abajo)
+  --mode discover --site-url URL --output PATH --run-id ID (descubrimiento de categorías)
+
+Contrato de salida:
+- crawl: crawl-result.json con schema_version=1, data.categories, data.products, metrics.
+- discover: SOLO categorías, sin productos ni extracción de catálogo:
+  {"schema_version": 1, "run_id": ID,
+   "categories": [{"id": str único, "name": str, "url": URL absoluta, "parentId": id|null}],
+   "metrics": {...opcional}}
+- --scope apunta a un JSON [{"id", "url", "path": ["Raíz", "Hija", ...]}]. Solo se deben extraer
+  productos de esas categorías y cada producto lleva categoryPath igual al path de su categoría.
+Al soportar discover y --scope, agregar "category_scope" a manifest.capabilities (no antes).
 """
 
 from __future__ import annotations
@@ -51,6 +70,8 @@ def main() -> None:
     parser.add_argument("--site-url", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--mode", choices=["crawl", "discover"], default="crawl")
+    parser.add_argument("--scope")
     parser.parse_args()
     raise SystemExit(
         "CRAWLER_NOT_IMPLEMENTED: implement crawl.py before running the workspace"
