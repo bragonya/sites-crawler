@@ -150,14 +150,30 @@ def delete_workspace(root: Path, relative: str) -> dict[str, Any]:
     return {"path": relative, "deleted": True}
 
 
+def _allowed_host_variants(allowed_host: str) -> set[str]:
+    host = (allowed_host or "").strip().lower().rstrip(".")
+    if not host:
+        return set()
+    bare = host[4:] if host.startswith("www.") else host
+    return {bare, f"www.{bare}"}
+
+
+def _validate_public_site_host(url: str, allowed_hosts: set[str]) -> None:
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    if hostname not in allowed_hosts:
+        raise WorkspaceError("web_fetch solo permite el host del sitio en esta corrida")
+
+
 def fetch_public_url(url: str, allowed_host: str, build_root: Path, max_bytes: int = 20_000) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise WorkspaceError("web_fetch requiere una URL HTTP(S) pública")
-    if parsed.hostname != allowed_host:
+    allowed_hosts = _allowed_host_variants(allowed_host)
+    if parsed.hostname.lower().rstrip(".") not in allowed_hosts:
         raise WorkspaceError("web_fetch solo permite el host del sitio en esta corrida")
     with httpx.Client(timeout=20, follow_redirects=True, headers={"User-Agent": "StacklineCrawlerAgent/1.0"}) as client:
         response = client.get(url)
+    _validate_public_site_host(str(response.url), allowed_hosts)
     content = response.content[:max_bytes]
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     evidence_path = build_root / "evidence" / "agent" / f"{digest}.html"
