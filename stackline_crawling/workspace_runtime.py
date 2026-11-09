@@ -164,6 +164,22 @@ def _validate_public_site_host(url: str, allowed_hosts: set[str]) -> None:
         raise WorkspaceError("web_fetch solo permite el host del sitio en esta corrida")
 
 
+def canonical_site_url(site_url: str) -> str:
+    """Follow a same-site bare/www redirect before invoking generated code."""
+    parsed = urlparse(site_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return site_url
+    allowed_hosts = _allowed_host_variants(parsed.hostname)
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True, headers={"User-Agent": "StacklineCrawler/1.0"}) as client:
+            response = client.get(site_url)
+        final_url = str(response.url)
+        _validate_public_site_host(final_url, allowed_hosts)
+        return final_url
+    except (httpx.HTTPError, WorkspaceError, ValueError):
+        return site_url
+
+
 def fetch_public_url(url: str, allowed_host: str, build_root: Path, max_bytes: int = 20_000) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -232,7 +248,7 @@ def run_workspace(
     stdout_path = build_root / "logs" / f"runner.{mode}.stdout.log"
     stderr_path = build_root / "logs" / f"runner.{mode}.stderr.log"
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(script), "--site-url", site_url, "--output", str(output_path), "--run-id", run_id]
+    command = [sys.executable, str(script), "--site-url", canonical_site_url(site_url), "--output", str(output_path), "--run-id", run_id]
     if mode == "discover":
         command += ["--mode", "discover"]
     elif scope_path is not None:
