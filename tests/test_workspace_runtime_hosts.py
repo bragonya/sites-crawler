@@ -7,6 +7,7 @@ from stackline_crawling.workspace_runtime import WorkspaceError, fetch_public_ur
 
 
 class _Response:
+    status_code = 200
     content = b"<html>ok</html>"
     encoding = "utf-8"
     headers = {"content-type": "text/html"}
