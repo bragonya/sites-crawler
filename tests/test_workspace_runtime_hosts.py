@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from stackline_crawling import workspace_runtime
-from stackline_crawling.workspace_runtime import WorkspaceError, fetch_public_url
+from stackline_crawling.workspace_runtime import WorkspaceError, canonical_site_url, fetch_public_url
 
 
 class _Response:
@@ -58,3 +58,13 @@ def test_www_allowed_host_also_accepts_bare_variant():
     assert workspace_runtime._allowed_host_variants("www.example.com") == {
         "example.com", "www.example.com",
     }
+
+
+def test_generated_workspace_uses_same_site_canonical_redirect(monkeypatch):
+    monkeypatch.setattr(
+        workspace_runtime.httpx,
+        "Client",
+        lambda **_kwargs: _Client("https://www.example.com/catalog"),
+    )
+
+    assert canonical_site_url("https://example.com") == "https://www.example.com/catalog"
